@@ -49,6 +49,13 @@ void director_set_pairing_touch(bool on);
 // then skips the button's normal action, push to talk or brightness);
 // otherwise false.
 bool director_button(bool main_button);
+// Another page (pages.h) covers the meters, or the meters are back. Away,
+// Clawd is parked off screen with nothing staged and no beat starts; an
+// alert still arrives, times out, and a tap still dismisses it. Back, he
+// walks to his seat, or into the attention beat if an alert is up. by_you:
+// the return was a press (you're here), not a timer.
+void director_set_away(bool away, bool by_you = true);
+bool director_attention(void);              // an alert is up
 // Apply a liveliness level (clawd_policy.h) now: the tuning changes, and
 // what the new level rules out (a show, the screensaver, idle acts, a
 // pending reaction) stops.

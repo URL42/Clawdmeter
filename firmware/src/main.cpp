@@ -21,6 +21,8 @@
 #include "clawd_prefs.h"
 #include "perf.h"
 #include "pair_hold.h"
+#include "pages.h"
+#include "sessions_page.h"
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -132,6 +134,26 @@ static void clear_pairing(const char* why) {
     ui_set_pair_hint(PAIR_HINT_CLEARED);
 }
 
+// ---- Pages (pages.h): the meters are home; the others cover them ----
+static PageNav nav;
+
+static const char* page_name(Page p) { return p == PAGE_HOME ? "home" : "sessions"; }
+
+// by_you: a press or touch, not the idle return (which mustn't count as
+// you being here, or the screensaver it hands the panel back to waits again).
+static void show_page(Page p, bool by_you = true) {
+    if (!page_nav_go(&nav, p, millis())) return;
+    Serial.printf("[%lu] page: %s\n", (unsigned long)millis(), page_name(p));
+    sessions_page_show(p == PAGE_SESSIONS);
+    director_set_away(p != PAGE_HOME, by_you);
+}
+
+// Only a board with a button to page with (or PWR to go home) is sent off
+// the meters by an alert; a board without one would be stuck there.
+static bool pages_navigable(void) {
+    return board_caps().button_count > 0 || board_caps().has_pwr_button;
+}
+
 // ---- Serial command buffer ----
 #define CMD_BUF_SIZE 64
 static char cmd_buf[CMD_BUF_SIZE];
@@ -182,6 +204,16 @@ static void send_info() {
                   CLAWD_ENV, CLAWD_VERSION, board_hal_rev());
 }
 
+// Internal RAM headroom, for sizing new UI on boards without PSRAM: free now,
+// the largest single block, and the low-water mark since boot.
+static void send_heap() {
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    Serial.printf("{\"heap\":{\"free\":%u,\"largest\":%u,\"min\":%u}}\n",
+                  (unsigned)heap_caps_get_free_size(caps),
+                  (unsigned)heap_caps_get_largest_free_block(caps),
+                  (unsigned)heap_caps_get_minimum_free_size(caps));
+}
+
 static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
@@ -203,6 +235,16 @@ static void check_serial_cmd() {
             }
             else if (strcmp(cmd_buf, "info") == 0)  send_info();
             else if (strcmp(cmd_buf, "perf") == 0)  perf_print();
+            else if (strcmp(cmd_buf, "heap") == 0)  send_heap();
+            else if (strcmp(cmd_buf, "page") == 0 || strncmp(cmd_buf, "page ", 5) == 0) {
+                // QA: `page [home|sessions|next|prev]`, as the buttons would.
+                const char* a = cmd_buf[4] == ' ' ? cmd_buf + 5 : "";
+                if      (strcmp(a, "home") == 0)     show_page(PAGE_HOME);
+                else if (strcmp(a, "sessions") == 0) show_page(PAGE_SESSIONS);
+                else if (strcmp(a, "next") == 0)     show_page(page_step(nav.page, +1));
+                else if (strcmp(a, "prev") == 0)     show_page(page_step(nav.page, -1));
+                Serial.printf("{\"page\":\"%s\"}\n", page_name(nav.page));
+            }
             else if (strcmp(cmd_buf, "ble") == 0) ble_print_status();
             else if (strcmp(cmd_buf, "disconnect") == 0) ble_disconnect_all();
             else if (strcmp(cmd_buf, "unpair") == 0) {
@@ -287,6 +329,9 @@ void setup() {
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging(), power_hal_is_vbus_in());
     director_init();    // rooms + beats; boots on the meters (home)
+    sessions_page_init();
+    sessions_page_set_link(ble_get_state() == BLE_STATE_CONNECTED);
+    page_nav_init(&nav, millis());
     clawd_prefs_init();  // the saved device settings, before the app says otherwise
 
     Serial.printf("Dashboard ready (%s, %dx%d) %lu ms after boot, waiting for data on BLE...\n",
@@ -349,7 +394,8 @@ static void touch_pair_tick(void) {
     if (board_caps().has_pwr_button) return;
     // Taps on the hint don't make Clawd peek (the face would cover it).
     director_set_pairing_touch(ui_pair_hint_visible());
-    const bool enabled = ui_pair_hint_visible() && director_room() == ROOM_METERS && !idle_is_asleep();
+    const bool enabled = ui_pair_hint_visible() && nav.page == PAGE_HOME &&
+                         director_room() == ROOM_METERS && !idle_is_asleep();
     switch (pair_hold_step(&touch_hold, enabled, touch_down, millis())) {
     case PAIR_HOLD_HOLDING:
         Serial.println("Pair: touch hold, keep holding to clear the pairing");
@@ -384,57 +430,84 @@ void loop() {
     // is detected by the next tick after wake and ramped in then.
     if (!idle_is_asleep()) display_hal_tick();
 
-    // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → cycle brightness; hold ~3s + release: pairing mode
+    // ---- Physical buttons (gestures in pages.h) ----
+    //   PRIMARY   tap → previous page; hold → HID Space while held (voice PTT)
+    //   SECONDARY tap → next page; hold → HID Shift+Tab once (mode toggle)
+    //   PWR       → home; already home, cycle brightness; hold ~3s + release: pairing mode
     // Any press also tells the director you're here (wakes the screensaver).
-    // First press from sleep is consumed as a wake-only event by
-    // idle_consume_wake_press(); the normal action fires from the second
-    // press. Activity bookkeeping happens inside idle_consume_wake_press
+    // A press that wakes the dark panel is consumed as a wake-only event by
+    // idle_consume_wake_press(), and the rest of that press (its tap or hold)
+    // is ignored. Activity bookkeeping happens inside idle_consume_wake_press
     // so no separate idle_note_activity() call is needed here.
     {
-        static bool primary_was = false;
-        static bool primary_wake_swallowed = false;
-        bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
-        if (primary_now != primary_was) {
-            if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                // No touchscreen: BOOT dismisses an active alert first and is
-                // not a push-to-talk press then.
-                else if (director_button(true)) primary_wake_swallowed = true;
-                else { ble_keyboard_press(0x2C, 0); }                     // HID Space, no mods
-            } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
-            }
-            primary_was = primary_now;
+        const uint32_t now = millis();
+        if (touch_down) page_nav_note_input(&nav, now);
+
+        static ButtonGesture primary = {};
+        static bool primary_swallowed = false;
+        switch (gesture_step(&primary, input_hal_is_held(INPUT_BTN_PRIMARY), now, BTN_PTT_HOLD_MS)) {
+        case GESTURE_PRESS:
+            // No touchscreen: BOOT dismisses an active alert first and does
+            // nothing else with that press.
+            primary_swallowed = idle_consume_wake_press() || director_button(true);
+            if (!primary_swallowed) page_nav_note_input(&nav, now);
+            break;
+        case GESTURE_TAP:
+            if (!primary_swallowed) show_page(page_step(nav.page, -1));
+            break;
+        case GESTURE_HOLD_START:
+            if (!primary_swallowed) ble_keyboard_press(0x2C, 0);           // HID Space, no mods
+            break;
+        case GESTURE_HOLD_END:
+            if (!primary_swallowed) ble_keyboard_release();
+            break;
+        case GESTURE_NONE:
+            break;
         }
 
         if (board_caps().button_count >= 2) {
-            static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
-            bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
-            if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else { ble_keyboard_press(0x2B, 0x02); director_button(false); }  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
+            static ButtonGesture secondary = {};
+            static bool secondary_swallowed = false;
+            switch (gesture_step(&secondary, input_hal_is_held(INPUT_BTN_SECONDARY), now, BTN_MODE_HOLD_MS)) {
+            case GESTURE_PRESS:
+                secondary_swallowed = idle_consume_wake_press();
+                if (!secondary_swallowed) { director_button(false); page_nav_note_input(&nav, now); }
+                break;
+            case GESTURE_TAP:
+                if (!secondary_swallowed) show_page(page_step(nav.page, +1));
+                break;
+            case GESTURE_HOLD_START:
+                // One Shift+Tab, released at once: holding it down would let
+                // the computer's key repeat cycle through several modes. The
+                // release lets go of every key, so a push to talk still held
+                // on BOOT gets its Space back.
+                if (!secondary_swallowed) {
+                    ble_keyboard_press(0x2B, 0x02);                      // HID Tab + LEFT_SHIFT
+                    ble_keyboard_release();
+                    if (primary.holding && !primary_swallowed) ble_keyboard_press(0x2C, 0);
                 }
-                secondary_was = secondary_now;
+                break;
+            case GESTURE_HOLD_END:
+            case GESTURE_NONE:
+                break;
             }
         }
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // Counts as you being here. On a touchless board whose only
-                // button this is, it dismisses an active alert first; else it
-                // cycles brightness.
-                if (!director_button(board_caps().button_count == 0)) brightness_cycle();
+                // Counts as you being here. Off home it goes home. Home, on a
+                // touchless board whose only button this is, it dismisses an
+                // active alert first; else it cycles brightness.
+                page_nav_note_input(&nav, now);
+                if (nav.page != PAGE_HOME) show_page(PAGE_HOME);
+                else if (!director_button(board_caps().button_count == 0)) brightness_cycle();
             }
         }
+
+        // Off home with nothing waiting and nobody touching anything: home,
+        // so the screensaver and Clawd get the panel back.
+        if (!director_attention()) sessions_page_set_alert(NULL);
+        if (page_nav_idle_home_due(&nav, now, director_attention())) show_page(PAGE_HOME, false);
 
         pair_tick();
         touch_pair_tick();
@@ -444,6 +517,7 @@ void loop() {
     if (bs != last_ble_state) {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+        sessions_page_set_link(bs == BLE_STATE_CONNECTED);
     }
 
     static int  last_pct      = -2;
@@ -489,6 +563,7 @@ void loop() {
             }
             if (usage.pace_marker >= 0) pace_marker_set(usage.pace_marker != 0);
             ui_update(&usage);
+            sessions_page_update(&usage);
             // A prompt (or you're back after a gap): you're at the computer,
             // so a dimmed or dark panel wakes before Clawd notices you. A
             // Stop or tool activity doesn't: Claude working alone isn't you.
@@ -500,7 +575,11 @@ void loop() {
             if (usage.alert_msg[0]) {
                 Serial.println("attention — mascot");
                 idle_note_activity();
+                // The app sends `m` once per alert (a repeat from the same
+                // session isn't resent), so each one brings up Sessions.
+                if (pages_navigable()) show_page(PAGE_SESSIONS);
                 director_alert(usage.alert_msg);
+                sessions_page_set_alert(usage.alert_msg);
             }
             if (usage.alert_clear) director_alert_clear();
             if (g_after != g_before)

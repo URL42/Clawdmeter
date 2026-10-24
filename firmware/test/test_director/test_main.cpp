@@ -98,6 +98,7 @@ static uint32_t fz_range(uint32_t lo, uint32_t hi) { return lo + fz_next() % (hi
 // director_init() is for boot; between runs, also drop what a run left
 // pending (this file includes the director, so its statics are in reach).
 static void fresh_director(void) {
+    away = false;
     attention_on = false;
     resume_screensaver = false;
     react_anim = NULL;
@@ -130,7 +131,7 @@ static void fuzz(uint32_t seed, uint32_t total_ms, bool has_big) {
         t += gap;
         UsageData d = live_payload();
         SignalsUpdate sig = no_signal();
-        switch (fz_next() % 16) {
+        switch (fz_next() % 17) {
         case 0: case 1:  world.activity = (int)fz_range(0, 3); break;
         case 2:          world.activity = 3; break;
         case 3: case 4:  sig.event_fired = true; sig.event = "psb"[fz_next() % 3]; sig.event_seq = ++es; break;
@@ -147,6 +148,7 @@ static void fuzz(uint32_t seed, uint32_t total_ms, bool has_big) {
             continue;
         }
         case 14:         director_set_liveliness((int)fz_range(1, 5)); continue;
+        case 15:         director_set_away(!away); continue;   // a page button
         default:         break;                   // a quiet stretch
         }
         d.session_pct = pct;
@@ -155,6 +157,7 @@ static void fuzz(uint32_t seed, uint32_t total_ms, bool has_big) {
     assert_one_clawd();
     // Left alone afterwards, nothing hangs: whatever was running finishes
     // and he ends up home or in the screensaver.
+    director_set_away(false);
     director_alert_clear();
     world.meters_live = true;
     world.activity = 0;
@@ -334,8 +337,110 @@ static void test_fuzz_one_clawd_at_every_attention_animation(void) {
     assert_one_clawd();
 }
 
+// Another page covers the meters: he's parked off screen, and nothing that
+// happens meanwhile (busy stretches, prompts, usage moving, quiet time)
+// brings him out or starts a beat. Back home, he walks to his seat.
+static void away_parks_him(bool has_big) {
+    world.has_big = has_big;
+    fresh_director();
+    run_for(2000);
+    director_set_away(true);
+    world.activity = 3;
+    uint32_t es = 0;
+    for (int i = 0; i < 20; i++) {
+        UsageData d = live_payload();
+        SignalsUpdate sig = no_signal();
+        sig.event_fired = true;
+        sig.event = "psb"[i % 3];
+        sig.event_seq = ++es;
+        d.session_pct = 10 + i;
+        send(d, sig);
+        run_for(15 * 1000);
+        const OnScreen s = fake_on_screen();
+        TEST_ASSERT_EQUAL_MESSAGE(0, fake_clawds(s), "nobody out while away");
+        TEST_ASSERT_EQUAL_STRING("home", director_beat_name());
+    }
+    world.activity = 0;
+    director_set_away(false);
+    // He comes back on screen (after a busy stretch he may go on to a show).
+    bool back = false;
+    for (int i = 0; i < 500 && !back; i++) {
+        run_for(TICK_MS);
+        back = fake_clawds(fake_on_screen()) > 0;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(back, "he comes back on screen");
+    assert_one_clawd();
+}
+static void test_away_parks_him_with_full_size_sprite(void) { away_parks_him(true); }
+static void test_away_parks_him_without_full_size_sprite(void) { away_parks_him(false); }
+
+// An alert while away waits for you: no animation behind the page, a tap
+// there still dismisses it (and tells the app), and one still up when you
+// come home gets its animation then.
+static void test_alert_while_away(void) {
+    world.has_big = true;
+    fresh_director();
+    director_set_away(true);
+    director_alert("needs you");
+    run_for(2000);
+    TEST_ASSERT_TRUE(director_attention());
+    TEST_ASSERT_FALSE(fake_attention_animating());
+    director_tap(200);
+    TEST_ASSERT_FALSE(director_attention());
+    TEST_ASSERT_TRUE(director_take_dismissed());
+
+    director_alert("needs you again");
+    run_for(1000);
+    director_set_away(false);
+    run_for(3000);
+    TEST_ASSERT_TRUE(fake_attention_animating());
+    TEST_ASSERT_EQUAL_STRING("attention", director_beat_name());
+    assert_one_clawd();
+}
+
+// Nobody comes: the alert times out behind the page just as it would on
+// the meters, and coming home afterwards is an ordinary return.
+static void test_alert_times_out_while_away(void) {
+    world.has_big = false;
+    fresh_director();
+    director_set_away(true);
+    director_alert("needs you");
+    run_for(60 * 1000);
+    TEST_ASSERT_FALSE(director_attention());
+    TEST_ASSERT_TRUE(director_take_dismissed());
+    director_set_away(false);
+    run_for(5000);
+    TEST_ASSERT_EQUAL_STRING("home", director_beat_name());
+    assert_one_clawd();
+}
+
+// The idle return home is a timer, not you: after a long quiet spell away,
+// the screensaver comes right back. A press home counts as you being here.
+static void test_timer_return_keeps_the_quiet(void) {
+    world.has_big = true;
+    fresh_director();
+    director_set_away(true);
+    run_for(30 * 1000);                          // longer than the quiet before the screensaver
+    director_set_away(false, false);
+    run_for(10 * 1000);
+    TEST_ASSERT_EQUAL_STRING("screensaver", director_beat_name());
+
+    fresh_director();
+    director_set_away(true);
+    run_for(30 * 1000);
+    director_set_away(false);                    // PWR: you're here
+    run_for(10 * 1000);
+    TEST_ASSERT_TRUE(strcmp(director_beat_name(), "screensaver") != 0);
+    assert_one_clawd();
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
+    RUN_TEST(test_timer_return_keeps_the_quiet);
+    RUN_TEST(test_away_parks_him_with_full_size_sprite);
+    RUN_TEST(test_away_parks_him_without_full_size_sprite);
+    RUN_TEST(test_alert_while_away);
+    RUN_TEST(test_alert_times_out_while_away);
     RUN_TEST(test_screensaver_calm_dip_keeps_one_clawd);
     RUN_TEST(test_fuzz_one_clawd_with_full_size_sprite);
     RUN_TEST(test_fuzz_one_clawd_without_full_size_sprite);

@@ -39,6 +39,7 @@ static uint8_t  step = 0;
 static uint32_t wait_until = 0;
 static bool     performing = false;   // he's out as the performer on the meters
 static bool     notice_wake = false;  // B_FACE_HOME: blink first (he noticed you)
+static bool     away = false;         // another page covers the meters (director_set_away)
 
 // Attention
 static bool     attention_on = false;
@@ -82,7 +83,7 @@ static void go(Beat b) {
     beat = b;
     step = 0;
     wait_until = now_ms();
-    mascot_autonomy(b == B_HOME && !minimal && clawd_tuning().idle_acts);
+    mascot_autonomy(b == B_HOME && !minimal && !away && clawd_tuning().idle_acts);
 }
 
 void director_set_trace(bool on) { trace = on; }
@@ -126,7 +127,7 @@ static void arrive_meters(void) {
 // trip he cuts it short and hurries back, then reacts (anticipation: the
 // reaction is never just dropped). Only on the meters with nothing staged.
 static void react(const char* anim, uint8_t times) {
-    if (!clawd_tuning().reactions) return;
+    if (!clawd_tuning().reactions || away) return;
     if (beat != B_HOME && beat != B_CORNER) return;
     if (mascot_act(anim, times)) { react_anim = NULL; go(B_CORNER); return; }
     if (!mascot_hurry_home()) return;
@@ -247,6 +248,7 @@ static void tap_home(int x) {
 void director_tap(int x) {
     engage();
     if (attention_on) { end_attention(ATTN_END_TAP); return; }   // a dismissing tap does nothing else
+    if (away) return;                             // a tap on another page isn't on the meters
     resume_screensaver = false;                   // "show me the meters" wins
     if (minimal) return;
     if (beat == B_HOME || beat == B_CORNER) {
@@ -290,8 +292,35 @@ void director_set_liveliness(int level) {
     if (!t.reactions) { react_anim = NULL; joy_pending = false; }
     if (!t.screensaver) resume_screensaver = false;
     if ((beat == B_SHOW && !t.shows) || (beat == B_SCREENSAVER && !t.screensaver)) to_meters(false);
-    mascot_autonomy(beat == B_HOME && !minimal && t.idle_acts);
+    mascot_autonomy(beat == B_HOME && !minimal && !away && t.idle_acts);
 }
+
+// Another page covers the meters. Nobody sees him leave, so there's no exit
+// to play: he's parked off screen with nothing staged, and only an alert's
+// timers keep running (director_tick). Coming back by_you counts as you being
+// here. Either way he walks back to his seat, or straight into the attention
+// beat while an alert is still up.
+void director_set_away(bool on, bool by_you) {
+    if (on == away) return;
+    away = on;
+    Serial.printf("[%lu] director: %s\n", (unsigned long)now_ms(), on ? "away (another page)" : "back on the meters");
+    resume_screensaver = false;
+    if (on) {
+        react_anim = NULL;
+        face_set_resting(false);
+        face_hide_now();
+        performer_place_offstage(PERFORMER_LEFT);
+        performing = false;
+        mascot_reset();                       // ends an attention act too; it replays on return
+        if (!minimal) mascot_place_away();
+        go(attention_on ? B_ATTENTION : B_HOME);
+        return;
+    }
+    if (by_you) engage();
+    arrive_meters();
+}
+
+bool director_attention(void) { return attention_on; }
 
 static void indev_cb(lv_event_t* e) {
     (void)e;
@@ -318,18 +347,18 @@ void director_on_payload(const UsageData* d, const SignalsUpdate* sig) {
         // Fresh window: jumping happy twice, the same moment as the chime if
         // he's home, else when he gets back. Never on replays (signals only
         // reports real samples). It outranks the notice / wave below.
-        if (beat == B_HOME && mascot_act("jumping happy", 2)) go(B_CORNER);
+        if (beat == B_HOME && !away && mascot_act("jumping happy", 2)) go(B_CORNER);
         else {
             joy_pending = true;
             joy_at = now_ms();
-            if (beat == B_HOME) mascot_hurry_home();   // out on a trip: come back for it
+            if (beat == B_HOME && !away) mascot_hurry_home();   // out on a trip: come back for it
         }
     }
 
     if (sig->event_fired) {
         engage();
         const bool wave = turn_on_event(&turn, sig->event, now_ms(), &clawd_tuning());
-        if (minimal) return;
+        if (minimal || away) return;
         if (sig->event == 'p' || sig->event == 'b') {
             resume_screensaver = false;       // you're back
             if (beat == B_SCREENSAVER) {
@@ -660,6 +689,13 @@ void director_tick(void) {
     if (activity > 0) last_engagement = now;
     face_tick();
 
+    if (away) {
+        // Parked behind another page: only an alert's timeout runs.
+        if (attention_on && (uint32_t)(now - attention_since) >= clawd_tuning().alert_timeout_ms)
+            end_attention(ATTN_END_TIMEOUT);
+        return;
+    }
+
     switch (beat) {
     case B_HOME:        run_home(now); break;
     case B_CORNER:      run_corner(now); break;
@@ -674,6 +710,7 @@ void director_tick(void) {
 
 // ─── QA ──────────────────────────────────────────────────────────────────────
 bool director_debug(const char* name) {
+    if (away && strcmp(name, "attention") != 0) return false;   // nothing to see behind another page
     if (strcmp(name, "home") == 0) {
         // "Show me the meters" (a tap anywhere but home, without the peek).
         engage();
