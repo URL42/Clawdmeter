@@ -28,7 +28,8 @@ is faked behind `FlashHardware`.
   optional year; fixtures in `tests/fixtures/` are real or derived from the
   CLI source), `probe` / `oauth` (usage sources), `cadence` (when to poll),
   `backoff`, `selector` (which account is shown), `events` (tails
-  `events.log`), `attention`, `payload`, `rate`, `engine` (I/O-free state
+  `events.log`), `sessions` (the device's session list, `ss`), `attention`,
+  `payload`, `rate`, `engine` (I/O-free state
   machine: `next_write` / `mark_written`), `autostart` (systemd / XDG /
   LaunchAgent / Run key, legacy-daemon detection + `disable_legacy`),
   `launch`, `platform`.

@@ -4,6 +4,14 @@
 // Plain data, no Arduino types, so payload parsing and the signal logic can be
 // unit-tested on the host (test/test_signals).
 
+// One row of the `ss` session list (the app's sessions.rs).
+#define SESSION_ROWS_MAX 4
+struct SessionRowData {
+    char     name[25];       // project, or the start of the session id
+    char     state;          // 'w' waiting, 'r' working, 'd' done, 'i' idle
+    uint32_t age_s;          // seconds in that state when sent
+};
+
 struct UsageData {
     float session_pct;       // utilization 0-100 (5h window Pro/Max; spending % Enterprise)
     int session_reset_mins;  // minutes until reset
@@ -35,6 +43,8 @@ struct UsageData {
     int8_t   liveliness;     // `lv` 1-5 (clamped); -1 = absent (keep the saved level)
     int16_t  attn_anim_s;    // `aa` attention animation, seconds 0-120 (0 = off); -1 = absent
     int8_t   pace_marker;    // `pm` 1 = pace marker on the usage bars, 0 = off; -1 = absent
+    int8_t   session_rows;   // `ss` rows in session_list, waiting first; -1 = absent
+    SessionRowData session_list[SESSION_ROWS_MAX];
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };

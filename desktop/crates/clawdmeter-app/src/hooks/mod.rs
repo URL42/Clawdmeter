@@ -9,14 +9,17 @@
 //!   id}`, one line; the kind lets the daemon drop alert types the user
 //!   turned off, see [`clawdmeter_core::attention::AlertKind`]);
 //! * `clear` touches `clear-<session id>`;
-//! * `event` appends `<unix_ts> <hook_event_name> <session_id>` to
-//!   `events.log`, rolling it to `events.log.1` past 256 KB.
+//! * `event` appends `<unix_ts> <hook_event_name> <session_id>` (then
+//!   `@<project>` and the config dir when it knows them, see [`event_line`])
+//!   to `events.log`, rolling it to `events.log.1` past 256 KB.
 //!
 //! `alert event` / `clear event` do both from one read of stdin. Only the
-//! event name and session id are recorded, never the prompt or the tool call.
-//! Hook stdout can reach the model, so the hook prints nothing and always
-//! exits 0. The file formats match the legacy `attention-hook.sh` byte for
-//! byte apart from the alert's `k`, which older readers ignore.
+//! event name, session id, project folder name and config dir are recorded,
+//! never the prompt or the tool call. Hook stdout can reach the model, so the
+//! hook prints nothing and always exits 0. The file formats match the legacy
+//! `attention-hook.sh` apart from the alert's `k` and the event line's
+//! `@<project>` (this fork), which older readers ignore or take as part of the
+//! config dir.
 
 pub mod install;
 
@@ -123,19 +126,49 @@ pub fn account_of(v: &Value) -> Option<String> {
     (!s.is_empty() && !s.chars().any(char::is_control)).then(|| s.to_owned())
 }
 
-/// `<ts> <event> <session> [<config dir>]`: event and session reduced to
-/// `[A-Za-z0-9_.-]`, the config dir ([`account_of`]) as the rest of the line
-/// when the input has a transcript path.
+/// The event name logged for a `Notification` of type `idle_prompt`.
+pub const IDLE_PROMPT_EVENT: &str = clawdmeter_core::sessions::IDLE_PROMPT_EVENT;
+
+/// The longest project name [`project_of`] keeps.
+pub const PROJECT_MAX: usize = 24;
+
+/// The project a hook input comes from, for the device's session list: the
+/// last component of its `cwd`, reduced to `[A-Za-z0-9_.-]` and cut to
+/// [`PROJECT_MAX`] characters.
+pub fn project_of(v: &Value) -> Option<String> {
+    let cwd = Path::new(v.get("cwd")?.as_str()?);
+    let name: String = sanitize(cwd.file_name()?.to_str()?).chars().take(PROJECT_MAX).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// `<ts> <event> <session> [@<project>] [<config dir>]`: event and session
+/// reduced to `[A-Za-z0-9_.-]`, the project ([`project_of`]) when the input
+/// has a `cwd`, and the config dir ([`account_of`]) as the rest of the line
+/// when it has a transcript path.
 pub fn event_line(v: &Value, now_unix: u64) -> Option<String> {
     // `.hook_event_name` on a non-object is a jq error: no line.
     let obj = as_jq_object(v)?;
-    let name = present(obj.get("hook_event_name")).map_or_else(|| "unknown".to_owned(), jq_tostring);
+    let mut name = present(obj.get("hook_event_name")).map_or_else(|| "unknown".to_owned(), jq_tostring);
+    // Claude Code's idle reminder ("waiting for your input", also after an
+    // interrupted turn) isn't a question: its own name lets the session list
+    // tell them apart.
+    if name == "Notification" && obj.get("notification_type").and_then(Value::as_str) == Some("idle_prompt") {
+        name = IDLE_PROMPT_EVENT.to_owned();
+    }
     let sid = present(obj.get("session_id")).map_or_else(|| "-".to_owned(), jq_tostring);
     let (name, sid) = (sanitize(&name), sanitize(&sid));
-    Some(match account_of(v) {
-        Some(acct) => format!("{now_unix} {name} {} {acct}\n", if sid.is_empty() { "-" } else { &sid }),
-        None => format!("{now_unix} {name} {sid}\n"),
-    })
+    let (project, account) = (project_of(v), account_of(v));
+    let mut line = format!("{now_unix} {name} ");
+    // A field after the session needs a placeholder for an empty one.
+    line.push_str(if sid.is_empty() && (project.is_some() || account.is_some()) { "-" } else { &sid });
+    if let Some(p) = project {
+        line.push_str(&format!(" @{p}"));
+    }
+    if let Some(a) = account {
+        line.push_str(&format!(" {a}"));
+    }
+    line.push('\n');
+    Some(line)
 }
 
 fn log_event(v: &Value, dir: &Path, now_unix: u64) -> io::Result<()> {
@@ -286,6 +319,23 @@ mod tests {
         assert_eq!(event_line(&v, 7).unwrap(), "7 unknown - /h/.claude\n");
         assert_eq!(account_of(&json!({"transcript_path": "/tmp/x.jsonl"})), None);
         assert_eq!(account_of(&json!({"transcript_path": "/h/pro\njects/projects/p/x.jsonl"})), None);
+        // The project is the cwd's last component, before the account.
+        let v = json!({"hook_event_name": "Stop", "session_id": "s", "cwd": "/home/me/code/herald-assistant",
+            "transcript_path": "/home/me/My Claude/projects/-home-me-code/s.jsonl"});
+        assert_eq!(event_line(&v, 7).unwrap(), "7 Stop s @herald-assistant /home/me/My Claude\n");
+        let parsed = clawdmeter_core::events::parse_line(event_line(&v, 7).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed.project.as_deref(), Some("herald-assistant"));
+        assert_eq!(parsed.account.as_deref(), Some(Path::new("/home/me/My Claude")));
+        let v = json!({"hook_event_name": "Stop", "cwd": "/w/My Project (old)/"});
+        assert_eq!(event_line(&v, 7).unwrap(), "7 Stop - @MyProjectold\n");
+        assert_eq!(project_of(&json!({"cwd": "/"})), None);
+        // The idle reminder gets its own name; other notifications keep theirs.
+        let idle = json!({"hook_event_name": "Notification", "notification_type": "idle_prompt", "session_id": "s"});
+        assert_eq!(event_line(&idle, 7).unwrap(), "7 IdlePrompt s\n");
+        let perm =
+            json!({"hook_event_name": "Notification", "notification_type": "permission_prompt", "session_id": "s"});
+        assert_eq!(event_line(&perm, 7).unwrap(), "7 Notification s\n");
+        assert_eq!(project_of(&json!({"cwd": "/a/abcdefghijklmnopqrstuvwxyz"})).unwrap(), "abcdefghijklmnopqrstuvwx");
     }
 
     #[test]

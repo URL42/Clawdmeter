@@ -230,7 +230,7 @@ mod tests {
     use crate::events::{HookEvent, HookKind};
 
     fn ev(ts: i64, kind: &str) -> HookEvent {
-        HookEvent { ts, kind: HookKind::parse(kind), session: "s".into(), account: None }
+        HookEvent { ts, kind: HookKind::parse(kind), session: "s".into(), project: None, account: None }
     }
 
     fn shown(last: i64) -> AccountClock {

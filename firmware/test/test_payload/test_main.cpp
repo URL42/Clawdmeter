@@ -121,6 +121,30 @@ static void test_pace_marker(void) {
     TEST_ASSERT_EQUAL_INT(1, d.pace_marker);
 }
 
+static void test_session_list(void) {
+    UsageData d;
+    TEST_ASSERT_TRUE(payload_parse("{\"ok\":true}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(-1, d.session_rows);     // absent: an app without the list
+    TEST_ASSERT_TRUE(payload_parse("{\"ss\":[]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(0, d.session_rows);
+    TEST_ASSERT_TRUE(payload_parse(
+        "{\"ss\":[[\"herald-assistant\",\"w\",95],[\"clawdmeter\",\"r\",4]]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(2, d.session_rows);
+    TEST_ASSERT_EQUAL_STRING("herald-assistant", d.session_list[0].name);
+    TEST_ASSERT_EQUAL_CHAR('w', d.session_list[0].state);
+    TEST_ASSERT_EQUAL_UINT32(95, d.session_list[0].age_s);
+    TEST_ASSERT_EQUAL_CHAR('r', d.session_list[1].state);
+    // Extra rows, non-rows, a long name, a negative age, a missing state.
+    TEST_ASSERT_TRUE(payload_parse(
+        "{\"ss\":[7,[\"abcdefghijklmnopqrstuvwxyz0123\",\"d\",-5],[\"b\"],[\"c\",\"i\",1],"
+        "[\"d\",\"i\",1],[\"e\",\"i\",1]]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(SESSION_ROWS_MAX, d.session_rows);
+    TEST_ASSERT_EQUAL_size_t(sizeof(d.session_list[0].name) - 1, strlen(d.session_list[0].name));
+    TEST_ASSERT_EQUAL_UINT32(0, d.session_list[0].age_s);
+    TEST_ASSERT_EQUAL_CHAR('i', d.session_list[1].state);
+    TEST_ASSERT_EQUAL_STRING("d", d.session_list[3].name);
+}
+
 static void test_long_strings_truncate(void) {
     UsageData d;
     TEST_ASSERT_TRUE(payload_parse("{\"st\":\"abcdefghijklmnopqrstuvwxyz\"}", &d, nullptr));
@@ -137,6 +161,7 @@ int main(void) {
     RUN_TEST(test_liveliness);
     RUN_TEST(test_attention_animation);
     RUN_TEST(test_pace_marker);
+    RUN_TEST(test_session_list);
     RUN_TEST(test_long_strings_truncate);
     return UNITY_END();
 }

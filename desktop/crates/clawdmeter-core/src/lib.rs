@@ -12,6 +12,7 @@
 //! * [`cadence`]: when to poll, when to heartbeat.
 //! * [`backoff`]: how long an account waits after a failed poll.
 //! * [`selector`]: which account to show.
+//! * [`sessions`]: the device's session list.
 //! * [`payload`]: the JSON the firmware parses.
 //! * [`rate`]: the slow-clock mood.
 //! * [`engine`]: all of the above as one I/O-free state machine.
@@ -35,6 +36,7 @@ pub mod platform;
 pub mod probe;
 pub mod rate;
 pub mod selector;
+pub mod sessions;
 pub mod usage;
 
 pub use config::{ConfigFile, Settings};

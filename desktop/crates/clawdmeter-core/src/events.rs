@@ -1,6 +1,7 @@
 //! The fast clock: Claude Code hook events.
 //!
-//! The hook (event mode) appends `<unix_ts> <HookEventName> <session_id>` to
+//! The hook (event mode) appends `<unix_ts> <HookEventName> <session_id>`
+//! (then `@<project>` and the config dir when it knows them) to
 //! `<state>/events.log` and exits. [`EventTail`] follows that file; the
 //! [`Activity`] tracker turns the lines into the payload's `a`, `e`/`es` and
 //! `n` fields and tells the poll scheduler what the user is doing.
@@ -56,6 +57,9 @@ pub struct HookEvent {
     pub kind: HookKind,
     /// Session id (may be empty).
     pub session: String,
+    /// The project the session runs in (its cwd's last component), when the
+    /// hook could tell.
+    pub project: Option<String>,
     /// The Claude Code config dir (account) the session runs under, when the
     /// hook could tell.
     pub account: Option<PathBuf>,
@@ -68,9 +72,10 @@ fn token(s: &str) -> Option<(&str, &str)> {
     (end > 0).then(|| (&s[..end], &s[end..]))
 }
 
-/// Parse `<unix_ts> <HookEventName> [<session_id> [<config dir>]]`; the
-/// config dir is the rest of the line (it may hold spaces). Fractional
-/// timestamps are accepted (truncated). Returns `None` for anything else.
+/// Parse `<unix_ts> <HookEventName> [<session_id> [@<project>] [<config dir>]]`;
+/// the config dir is the rest of the line (it may hold spaces, but never
+/// starts with `@`). Fractional timestamps are accepted (truncated). Returns
+/// `None` for anything else.
 pub fn parse_line(line: &str) -> Option<HookEvent> {
     let (ts_raw, rest) = token(line)?;
     let ts = match ts_raw.split_once('.') {
@@ -83,12 +88,16 @@ pub fn parse_line(line: &str) -> Option<HookEvent> {
     let (session, rest) = token(rest).unwrap_or(("", ""));
     // The hook writes "-" when a payload has no session id.
     let session = if session == "-" { "" } else { session }.to_owned();
+    let (project, rest) = match token(rest) {
+        Some((p, after)) if p.len() > 1 && p.starts_with('@') => (Some(p[1..].to_owned()), after),
+        _ => (None, rest),
+    };
     let account = Some(rest.trim()).filter(|a| !a.is_empty()).map(PathBuf::from);
-    Some(HookEvent { ts, kind, session, account })
+    Some(HookEvent { ts, kind, session, project, account })
 }
 
 /// How much history to read at start-up for seeding the tracker.
-pub const SEED_BYTES: u64 = 64 * 1024;
+pub const SEED_BYTES: u64 = 80 * 1024;
 
 /// Follows events.log by byte offset. The hook rolls the log to
 /// `events.log.1` past ~256 KB (`mv -f`); when that happens the unread tail of
@@ -420,7 +429,7 @@ mod tests {
     use std::io::Write;
 
     fn ev(ts: i64, kind: &str, sid: &str) -> HookEvent {
-        HookEvent { ts, kind: HookKind::parse(kind), session: sid.into(), account: None }
+        HookEvent { ts, kind: HookKind::parse(kind), session: sid.into(), project: None, account: None }
     }
 
     #[test]
@@ -439,6 +448,13 @@ mod tests {
         assert_eq!(e.session, "abc");
         assert_eq!(parse_line("1760000000 Stop - /home/me/.claude").unwrap().session, "");
         assert_eq!(parse_line("1760000000 Stop abc  ").unwrap().account, None);
+        // `@<project>` sits between the session and the account.
+        let e = parse_line("1760000000 Stop abc @herald-assistant /home/me/My Claude").unwrap();
+        assert_eq!(e.project.as_deref(), Some("herald-assistant"));
+        assert_eq!(e.account.as_deref(), Some(std::path::Path::new("/home/me/My Claude")));
+        let e = parse_line("1760000000 Stop - @p").unwrap();
+        assert_eq!((e.session.as_str(), e.project.as_deref(), e.account), ("", Some("p"), None));
+        assert_eq!(parse_line("1760000000 Stop abc @ /x").unwrap().project, None);
     }
 
     #[test]

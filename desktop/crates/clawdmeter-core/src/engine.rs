@@ -17,6 +17,7 @@ use crate::payload::{clock_fields, Payload};
 use crate::probe::{self, Plan as ProbePlan, Source};
 use crate::rate::{Mood, RateTracker};
 use crate::selector::PlanSelector;
+use crate::sessions::{SessionRow, SessionTracker};
 use crate::usage::{AccountState, UsageError, UsageReading};
 
 /// `a` changes are sent at most this often (s).
@@ -125,6 +126,7 @@ pub struct Engine {
     settings: Settings,
     scheduler: Scheduler,
     activity: Activity,
+    sessions: SessionTracker,
     attention: AttentionState,
     selector: PlanSelector<PathBuf>,
     accounts: BTreeMap<PathBuf, AccountState>,
@@ -139,6 +141,8 @@ pub struct Engine {
     sent_a: Option<u8>,
     sent_a_at: i64,
     sent_n: Option<u32>,
+    /// The session list the device last got, without the ages (`ss`).
+    sent_ss: Option<Vec<(String, &'static str)>>,
     /// The liveliness the device last got (`lv`).
     sent_lv: Option<u8>,
     /// The attention animation the device last got (`aa`).
@@ -154,6 +158,12 @@ pub struct Engine {
     desktop_chime_due: bool,
 }
 
+/// The rows as sent, against the rows now: same names in the same states.
+fn same_rows(sent: &[(String, &'static str)], rows: &[SessionRow]) -> bool {
+    sent.len() == rows.len()
+        && sent.iter().zip(rows).all(|((name, code), r)| *name == r.name && *code == r.state.code())
+}
+
 fn utc(now: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(now, 0).single().unwrap_or_default()
 }
@@ -166,6 +176,7 @@ impl Engine {
             settings,
             scheduler: Scheduler::new(cadence),
             activity: Activity::default(),
+            sessions: SessionTracker::default(),
             attention: AttentionState::default(),
             selector: PlanSelector::default(),
             accounts: BTreeMap::new(),
@@ -180,6 +191,7 @@ impl Engine {
             sent_a: None,
             sent_a_at: i64::MIN / 2,
             sent_n: None,
+            sent_ss: None,
             sent_lv: None,
             sent_aa: None,
             sent_pm: None,
@@ -216,6 +228,9 @@ impl Engine {
     /// History from events.log at start-up (no `e` is emitted for it).
     pub fn seed_events(&mut self, events: &[HookEvent]) {
         self.activity.seed(events);
+        for ev in events {
+            self.sessions.record(ev);
+        }
     }
 
     /// One live hook event.
@@ -226,6 +241,7 @@ impl Engine {
                 None => self.unattributed_activity = self.unattributed_activity.max(Some(ev.ts)),
             }
         }
+        self.sessions.record(ev);
         match self.activity.ingest(ev) {
             Signal::Prompt { .. } => {
                 self.scheduler.on_prompt(now);
@@ -277,6 +293,7 @@ impl Engine {
         self.attention.reset();
         self.sent_a = None;
         self.sent_n = None;
+        self.sent_ss = None;
         self.sent_lv = None;
         self.sent_aa = None;
         self.sent_pm = None;
@@ -454,14 +471,19 @@ impl Engine {
     /// successful write; on failure just call this again next tick.
     pub fn next_write(&mut self, now: i64, host: HostClock) -> Option<Write> {
         self.activity.prune(now);
+        self.sessions.prune(now);
         let level = self.activity.level(now);
         let sessions = self.activity.sessions_active(now);
         let hooks = self.activity.hooks_seen;
+        let rows = self.sessions.rows(now);
         let event_fresh = self.last_event_ts.is_some_and(|t| now - t < EVENT_FRESH_SECS);
 
         let new_event = event_fresh && self.activity.seq != self.sent_seq;
         let a_changed = hooks && self.sent_a != Some(level) && now - self.sent_a_at >= ACTIVITY_MIN_INTERVAL;
         let n_changed = hooks && self.sent_n != Some(sessions);
+        // A row's state or the list changing goes out like an event; the ages
+        // alone don't (the device counts them on).
+        let ss_changed = hooks && self.sent_ss.as_ref().is_none_or(|sent| !same_rows(sent, &rows));
         // A changed device setting goes out right away, like an event.
         let aa = self.settings.attention_anim.seconds();
         let pm = u8::from(self.settings.pace_marker);
@@ -480,7 +502,7 @@ impl Engine {
                 WriteKind::Poll
             } else if self.attention.pending() {
                 WriteKind::Attention
-            } else if (new_event || a_changed || n_changed || prefs_changed) && !self.stale(now) {
+            } else if (new_event || a_changed || n_changed || ss_changed || prefs_changed) && !self.stale(now) {
                 // Any ok payload refreshes the device's DATA_FRESH_MS, so
                 // while the numbers are stale only alerts and polls go out
                 // and the device can show its stale state.
@@ -518,6 +540,7 @@ impl Engine {
         if hooks {
             payload.a = Some(level);
             payload.n = Some(sessions);
+            payload.ss = Some(rows.iter().map(|r| (r.name.clone(), r.state.code(), (now - r.since).max(0))).collect());
             if event_fresh {
                 if let Some(code) = self.activity.latest {
                     payload.e = Some(code.as_str().to_owned());
@@ -546,6 +569,9 @@ impl Engine {
         }
         if let Some(n) = w.payload.n {
             self.sent_n = Some(n);
+        }
+        if let Some(ss) = &w.payload.ss {
+            self.sent_ss = Some(ss.iter().map(|(name, code, _)| (name.clone(), *code)).collect());
         }
         if let Some(lv) = w.payload.lv {
             self.sent_lv = Some(lv);
@@ -630,7 +656,7 @@ mod tests {
     }
 
     fn ev(ts: i64, kind: &str) -> HookEvent {
-        HookEvent { ts, kind: HookKind::parse(kind), session: "s1".into(), account: None }
+        HookEvent { ts, kind: HookKind::parse(kind), session: "s1".into(), project: None, account: None }
     }
 
     fn write(e: &mut Engine, now: i64) -> Option<Write> {
@@ -907,6 +933,40 @@ mod tests {
         // Old events stop riding along after a minute.
         let w = e.next_write(T0 + 200, HostClock::default()).unwrap();
         assert_eq!((w.payload.e, w.payload.es), (None, None));
+    }
+
+    #[test]
+    fn session_list_reaches_the_device() {
+        let mut e = Engine::new(settings(""));
+        e.set_hooks_installed(true);
+        e.on_poll_results(T0, vec![(PathBuf::from("/h/.claude"), Ok(reading(15)))]);
+        write(&mut e, T0).unwrap();
+        let named = |ts, kind| HookEvent { project: Some("herald".into()), ..ev(ts, kind) };
+
+        e.on_hook_event(&named(T0 + 10, "UserPromptSubmit"), T0 + 10);
+        let w = write(&mut e, T0 + 10).unwrap();
+        assert_eq!(w.payload.ss, Some(vec![("herald".into(), "r", 0)]));
+        assert!(write(&mut e, T0 + 20).is_none(), "the ages alone don't write");
+
+        // A permission prompt changes the row: it goes out at once.
+        e.on_hook_event(&named(T0 + 30, "Notification"), T0 + 30);
+        let w = write(&mut e, T0 + 30).unwrap();
+        assert_eq!(w.kind, WriteKind::Event);
+        assert_eq!(w.payload.ss, Some(vec![("herald".into(), "w", 0)]));
+
+        // A done turn turns idle with no event, and that goes out too.
+        e.on_hook_event(&named(T0 + 40, "Stop"), T0 + 40);
+        write(&mut e, T0 + 40).unwrap();
+        let w = write(&mut e, T0 + 100).unwrap();
+        assert_eq!((w.kind, w.payload.ss.clone()), (WriteKind::Heartbeat, Some(vec![("herald".into(), "d", 60)])));
+        let idle_at = T0 + 40 + crate::sessions::DONE_SECS;
+        assert!(write(&mut e, idle_at - 1).is_none());
+        let w = write(&mut e, idle_at).unwrap();
+        assert_eq!(w.payload.ss, Some(vec![("herald".into(), "i", 0)]));
+
+        // A reconnect sends the list again.
+        e.on_connected();
+        assert!(write(&mut e, idle_at + 1).unwrap().payload.ss.is_some());
     }
 
     #[test]

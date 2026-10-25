@@ -77,6 +77,26 @@ bool payload_parse(const char* json, UsageData* out, const char** err) {
     JsonVariant pm = doc["pm"];
     d.pace_marker = pm.isNull() ? -1 : (int8_t)((pm | 0) ? 1 : 0);
 
+    // Session list: [name, state, seconds] rows; extra rows and anything
+    // that isn't a row are skipped.
+    JsonVariant ss = doc["ss"];
+    if (ss.isNull()) {
+        d.session_rows = -1;
+    } else {
+        int i = 0;
+        for (JsonVariant row : ss.as<JsonArray>()) {
+            if (i >= SESSION_ROWS_MAX) break;
+            if (!row.is<JsonArray>()) continue;
+            SessionRowData& r = d.session_list[i++];
+            copy_str(r.name, sizeof(r.name), row[0] | "");
+            const char* st = row[1] | "i";
+            r.state = st[0] ? st[0] : 'i';
+            const long age = row[2] | 0L;
+            r.age_s = age < 0 ? 0 : (uint32_t)age;
+        }
+        d.session_rows = (int8_t)i;
+    }
+
     d.ok = doc["ok"] | false;
     d.valid = true;
     *out = d;

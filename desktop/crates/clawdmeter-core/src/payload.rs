@@ -2,8 +2,8 @@
 //!
 //! Keys match `payload_parse()` in `firmware/src/payload.cpp`, in the order
 //! the old daemons wrote them, plus the additive fast-clock fields `a`, `e`,
-//! `es`, `n`, `rp` and Clawd's settings `lv` and `aa` (old firmware ignores
-//! unknown keys).
+//! `es`, `n`, `rp`, Clawd's settings `lv` and `aa`, and the session list `ss`
+//! (old firmware ignores unknown keys).
 
 use chrono::{DateTime, Datelike, Months, TimeZone, Utc};
 use serde::Serialize;
@@ -92,12 +92,20 @@ pub struct Payload {
     /// value it got.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pm: Option<u8>,
+    /// The session list ([`crate::sessions`]): `[name, state, seconds in
+    /// that state]` per row, what waits on you first. Empty: no sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ss: Option<Vec<SessionEntry>>,
 }
+
+/// One `ss` row: name, state code (`w` waiting, `r` working, `d` done, `i`
+/// idle) and seconds in that state (the device counts on from there).
+pub type SessionEntry = (String, &'static str, i64);
 
 /// Every key [`Payload`] can emit, in serialization order.
 pub const PAYLOAD_KEYS: &[&str] = &[
     "s", "sr", "w", "wr", "st", "acct", "tp", "pd", "rd", "t", "tf", "c", "ok", "b", "m", "x", "a", "e", "es", "n",
-    "rp", "lv", "aa", "pm",
+    "rp", "lv", "aa", "pm", "ss",
 ];
 /// The fast-clock keys added in v0.4 (old firmware ignores them).
 pub const ADDITIVE_KEYS: &[&str] = &["a", "e", "es", "n", "rp"];
@@ -284,11 +292,20 @@ impl Payload {
         serde_json::to_string(self).expect("payload serializes")
     }
 
-    /// JSON for one write of at most `limit` bytes: shorten the alert message,
-    /// then drop it, until it fits (Python daemon's `encode_payload`).
+    /// JSON for one write of at most `limit` bytes: drop session rows from the
+    /// end of the list (all of them: the list is left out, so the device keeps
+    /// the one it has), then shorten the alert message, then drop it, until it
+    /// fits (Python daemon's `encode_payload`, plus the rows).
     pub fn encode(&self, limit: usize) -> Vec<u8> {
         let mut data = self.to_json().into_bytes();
         let mut p = self.clone();
+        while data.len() > limit && p.ss.as_ref().is_some_and(|rows| !rows.is_empty()) {
+            p.ss.as_mut().map(Vec::pop);
+            if p.ss.as_ref().is_some_and(Vec::is_empty) {
+                p.ss = None;
+            }
+            data = p.to_json().into_bytes();
+        }
         let mut msg = p.m.clone().unwrap_or_default();
         while data.len() > limit && !msg.is_empty() {
             let over = data.len() - limit;
@@ -476,9 +493,23 @@ mod tests {
         assert!(long.len() <= 120);
         let v: serde_json::Value = serde_json::from_slice(&long).unwrap();
         assert!(v["m"].as_str().unwrap().ends_with("..."));
-        let tiny = Payload { m: Some("x".repeat(200)), ..base }.encode(26);
+        let tiny = Payload { m: Some("x".repeat(200)), ..base.clone() }.encode(26);
         let v: serde_json::Value = serde_json::from_slice(&tiny).unwrap();
         assert!(v.get("m").is_none());
+        // Session rows go before the message does, last row first.
+        let rows: Vec<SessionEntry> = (0..4).map(|i| (format!("project-{i}"), "r", 10)).collect();
+        let full = Payload { m: Some("Permission needed!".into()), ss: Some(rows), ..base };
+        let fits = full.encode(full.to_json().len() - 1);
+        let v: serde_json::Value = serde_json::from_slice(&fits).unwrap();
+        assert_eq!(v["m"], "Permission needed!");
+        assert_eq!(v["ss"].as_array().unwrap().len(), 3);
+        assert_eq!(v["ss"][2][0], "project-2");
+        assert_eq!(v["ss"][0], serde_json::json!(["project-0", "r", 10]));
+        // Out of rows: the list is left out, not sent empty.
+        let no_rows = Payload { ss: None, ..full.clone() }.to_json().len();
+        let tight = full.encode(no_rows);
+        let v: serde_json::Value = serde_json::from_slice(&tight).unwrap();
+        assert!(v.get("ss").is_none());
     }
 
     #[test]
@@ -508,6 +539,7 @@ mod tests {
             lv: Some(3),
             aa: Some(120),
             pm: Some(1),
+            ss: Some(vec![("herald".into(), "w", 30)]),
         };
         let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&pl.to_json()).unwrap();
         // serde_json's Map is sorted without preserve_order; check membership.

@@ -507,6 +507,7 @@ void loop() {
         // Off home with nothing waiting and nobody touching anything: home,
         // so the screensaver and Clawd get the panel back.
         if (!director_attention()) sessions_page_set_alert(NULL);
+        sessions_page_tick();
         if (page_nav_idle_home_due(&nav, now, director_attention())) show_page(PAGE_HOME, false);
 
         pair_tick();

@@ -15,6 +15,7 @@
 //   rp  1 = usage numbers are a replay        lv  liveliness 1-5 (clamped), -1 absent
 //   aa  attention animation seconds 0-120 (clamped, 0 = off), -1 absent
 //   pm  pace marker on the usage bars, 1 on / 0 off, -1 absent
+//   ss  session list: up to SESSION_ROWS_MAX [name, state, seconds] rows, -1 absent
 //
 // Returns false on malformed JSON; `*err` (if non-null) then points at a
 // static description. `out` is fully overwritten on success, untouched on
