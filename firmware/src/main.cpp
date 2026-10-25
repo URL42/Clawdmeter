@@ -431,7 +431,7 @@ void loop() {
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons (gestures in pages.h) ----
-    //   PRIMARY   tap → previous page; hold → HID Space while held (voice PTT)
+    //   PRIMARY   tap → previous page; hold → Control twice (macOS Dictation on / off)
     //   SECONDARY tap → next page; hold → HID Shift+Tab once (mode toggle)
     //   PWR       → home; already home, cycle brightness; hold ~3s + release: pairing mode
     // Any press also tells the director you're here (wakes the screensaver).
@@ -456,11 +456,19 @@ void loop() {
             if (!primary_swallowed) show_page(page_step(nav.page, -1));
             break;
         case GESTURE_HOLD_START:
-            if (!primary_swallowed) ble_keyboard_press(0x2C, 0);           // HID Space, no mods
+            // Control twice: macOS Dictation's default shortcut. It starts
+            // dictation into whatever has focus (Claude Code's prompt); the
+            // next hold stops it. The gaps let macOS see two separate presses.
+            if (!primary_swallowed) {
+                for (int i = 0; i < 2; i++) {
+                    ble_keyboard_press(0, 0x01);                        // LEFT_CTRL alone
+                    delay(40);
+                    ble_keyboard_release();
+                    delay(40);
+                }
+            }
             break;
         case GESTURE_HOLD_END:
-            if (!primary_swallowed) ble_keyboard_release();
-            break;
         case GESTURE_NONE:
             break;
         }
@@ -478,13 +486,10 @@ void loop() {
                 break;
             case GESTURE_HOLD_START:
                 // One Shift+Tab, released at once: holding it down would let
-                // the computer's key repeat cycle through several modes. The
-                // release lets go of every key, so a push to talk still held
-                // on BOOT gets its Space back.
+                // the computer's key repeat cycle through several modes.
                 if (!secondary_swallowed) {
                     ble_keyboard_press(0x2B, 0x02);                      // HID Tab + LEFT_SHIFT
                     ble_keyboard_release();
-                    if (primary.holding && !primary_swallowed) ble_keyboard_press(0x2C, 0);
                 }
                 break;
             case GESTURE_HOLD_END:

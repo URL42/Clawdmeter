@@ -2,18 +2,18 @@
 // Pages: the meters with Clawd (home) and the pages beside it, and the
 // side-button gestures that move between them.
 //
-//   BOOT  tap: previous page   hold: Space while held (Claude Code voice PTT)
+//   BOOT  tap: previous page   hold: Control twice (macOS Dictation on / off)
 //   KEY   tap: next page       hold: Shift+Tab once (Claude Code mode toggle)
 //   PWR   press: home; already home, brightness (main.cpp)
 //
-// A tap is a release before the hold threshold, so a quick press no longer
-// types a stray Space; push to talk starts BTN_PTT_HOLD_MS after the press.
+// A tap is a release before the hold threshold; dictation toggles
+// BTN_PTT_HOLD_MS into a press.
 //
 // Pure (no Arduino / LVGL) so the native tests cover it:
 //   pio test -d firmware -e native -f test_pages
 #include <stdint.h>
 
-#define BTN_PTT_HOLD_MS     250UL            // BOOT held this long → Space down
+#define BTN_PTT_HOLD_MS     250UL            // BOOT held this long → Dictation toggle
 #define BTN_MODE_HOLD_MS    600UL            // KEY held this long → Shift+Tab
 #define PAGE_IDLE_HOME_MS   (5UL * 60UL * 1000UL)  // off home, nothing waiting, no input → home
 
